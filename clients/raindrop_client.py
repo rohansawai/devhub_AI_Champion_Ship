@@ -548,7 +548,7 @@ class InferenceManager(BaseManager):
     """
     
     CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
-    DEFAULT_MODEL = "llama-4-scout-17b-16e-instruct"  # Fast model for hackathon
+    DEFAULT_MODEL = "llama-3.3-70b"  # Cerebras supported model
     
     def __init__(self, api_key: str, cerebras_api_key: str):
         super().__init__(api_key)
@@ -604,6 +604,11 @@ class InferenceManager(BaseManager):
                     messages.append({"role": "system", "content": system_prompt})
                 messages.append({"role": "user", "content": prompt})
                 
+                # Log the API call
+                print(f"🧠 [Cerebras] POST {self.CEREBRAS_URL}")
+                print(f"   Model: {model or self.DEFAULT_MODEL}")
+                print(f"   Prompt length: {len(prompt)} chars")
+                
                 # Make request to Cerebras
                 response = self._client.post(
                     self.CEREBRAS_URL,
@@ -620,6 +625,8 @@ class InferenceManager(BaseManager):
                 answer = data["choices"][0]["message"]["content"]
                 
                 latency_ms = int((time.time() - start_time) * 1000)
+                
+                print(f"✅ [Cerebras] Response in {latency_ms}ms")
                 
                 return {
                     "response": answer,

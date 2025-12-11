@@ -1,6 +1,7 @@
 """
 Query Service.
 Handles natural language queries about air quality data.
+Integrates OpenAQ real data with Cerebras AI for intelligent responses.
 """
 
 from typing import Optional, List, Dict, Any
@@ -8,7 +9,8 @@ import time
 import re
 
 from clients.raindrop_client import RaindropClient
-from services.data_service import DataService
+from clients.openaq_client import OpenAQClient
+from services.city_index_service import CityIndexService, normalize_city_name
 from models.query_result import QueryResult
 from models.air_reading import AirReading
 from config.settings import settings
@@ -18,62 +20,89 @@ class QueryService:
     """
     Service for handling natural language queries about air quality.
     
-    Responsibilities:
-    - Process user questions in natural language
-    - Retrieve relevant context from SmartBuckets
-    - Generate answers via Cerebras (SmartInference)
-    - Maintain conversation context via SmartMemory
+    This service:
+    1. Extracts city names from user questions
+    2. Fetches real-time data from OpenAQ via CityIndexService
+    3. Builds rich context from the data
+    4. Sends to Cerebras for intelligent interpretation
+    5. Returns comprehensive, data-backed answers
     
     Usage:
-        service = QueryService(raindrop_client, data_service)
+        service = QueryService(raindrop_client, openaq_client)
         result = service.ask("Is the air safe in Tokyo?")
         print(result.answer)
     """
     
-    SYSTEM_PROMPT = """You are AirSight, an AI assistant that provides instant, accurate air quality information.
+    SYSTEM_PROMPT = """You are AirSight, an expert AI assistant for air quality information.
 
-You have access to real-time air quality data from sensors worldwide via OpenAQ.
+You have access to REAL-TIME air quality data from monitoring stations worldwide.
 
-When answering questions:
-1. Be direct and concise - users want quick answers
-2. Always include specific measurements when available (PM2.5, AQI)
-3. Provide health recommendations based on AQI levels
-4. Use the health categories: Good, Moderate, Unhealthy for Sensitive Groups, Unhealthy, Very Unhealthy, Hazardous
-5. If air quality is concerning, clearly warn the user
+IMPORTANT RULES:
+1. ALWAYS use the provided data in your response - cite specific numbers
+2. Be direct and actionable - users want to know if it's safe
+3. Include health recommendations based on AQI levels
+4. If data shows dangerous levels, clearly warn the user
 
-AQI Reference:
-- 0-50: Good (Green) - Air quality is satisfactory
-- 51-100: Moderate (Yellow) - Acceptable, sensitive people may be affected
-- 101-150: Unhealthy for Sensitive Groups (Orange) - Sensitive groups should reduce outdoor activities
-- 151-200: Unhealthy (Red) - Everyone may begin to experience health effects
-- 201-300: Very Unhealthy (Purple) - Health alert, avoid outdoor activities
-- 301+: Hazardous (Maroon) - Health emergency, stay indoors
+AQI CATEGORIES (use these exact terms):
+- 0-50: Good (🟢) - Air quality is satisfactory
+- 51-100: Moderate (🟡) - Acceptable, sensitive people may be affected  
+- 101-150: Unhealthy for Sensitive Groups (🟠) - Sensitive groups should limit outdoor activities
+- 151-200: Unhealthy (🔴) - Everyone may experience health effects
+- 201-300: Very Unhealthy (🟣) - Health alert, avoid outdoor activities
+- 301+: Hazardous (🟤) - Health emergency, stay indoors
 
-Always respond in a helpful, informative tone. Keep responses under 150 words unless more detail is needed."""
+FORMAT YOUR RESPONSE:
+1. Start with the AQI category emoji and status
+2. State the actual PM2.5/AQI numbers
+3. Explain what this means for the user
+4. Give specific recommendations
 
-    # Common city name variations for extraction
+Keep responses concise but complete (under 200 words)."""
+
+    # Common city name variations
     CITY_ALIASES = {
-        "la": "Los Angeles",
-        "nyc": "New York",
-        "sf": "San Francisco",
-        "dc": "Washington",
-        "philly": "Philadelphia",
+        "nyc": "new york",
+        "ny": "new york", 
+        "la": "los angeles",
+        "sf": "san francisco",
+        "dc": "washington",
+        "philly": "philadelphia",
+        "vegas": "las vegas",
     }
     
-    def __init__(self, raindrop: RaindropClient, data_service: DataService):
+    def __init__(
+        self, 
+        raindrop: RaindropClient, 
+        openaq: OpenAQClient,
+        city_index: CityIndexService = None
+    ):
         """
         Initialize the query service.
         
         Args:
-            raindrop: Raindrop client for inference and memory
-            data_service: Data service for fetching air quality data
+            raindrop: Raindrop client for AI inference
+            openaq: OpenAQ client for data
+            city_index: Optional pre-initialized city index
         """
         self.raindrop = raindrop
-        self.data_service = data_service
+        self.openaq = openaq
+        
+        # Initialize city index
+        if city_index:
+            self.city_index = city_index
+        else:
+            self.city_index = CityIndexService(openaq)
+            self.city_index.load_index()
     
     def ask(self, question: str, user_id: str = "default") -> QueryResult:
         """
         Answer a natural language question about air quality.
+        
+        This is the main entry point. It:
+        1. Extracts the city from the question
+        2. Fetches real data from OpenAQ
+        3. Builds context for Cerebras
+        4. Returns an informed answer
         
         Args:
             question: User's question
@@ -88,51 +117,55 @@ Always respond in a helpful, informative tone. Keep responses under 150 words un
             return QueryResult.error("Please provide a question.", 0)
         
         try:
-            # 1. Get user context from SmartMemory
-            user_context = self.raindrop.memory.get_context(user_id)
-            
-            # 2. Extract city from question
+            # 1. Extract city from question
             city = self._extract_city(question)
             
-            # 3. Fetch fresh data if city found
-            readings = []
-            if city:
-                readings = self.data_service.get_air_quality(city, limit=5)
+            if not city:
+                # No city found - give general response
+                return self._handle_no_city(question, start_time)
             
-            # 4. Search SmartBuckets for additional context
-            relevant_docs = self.raindrop.buckets.search(
-                bucket_name="air-readings",
-                query=question,
-                limit=5,
-            )
+            # 2. Fetch real data from OpenAQ
+            readings = self.city_index.get_readings_for_city(city, limit=3)
             
-            # 5. Build context for the LLM
-            context = self._build_context(readings, relevant_docs, user_context)
+            if not readings:
+                # City recognized but no data
+                return self._handle_no_data(city, question, start_time)
             
-            # 6. Generate answer via Cerebras
-            prompt = self._build_prompt(question, context)
+            # 3. Build context from real data
+            context = self._build_data_context(city, readings)
             
+            # 4. Query Cerebras with real data
+            prompt = f"""USER QUESTION: {question}
+
+REAL-TIME AIR QUALITY DATA:
+{context}
+
+Based on this REAL data, provide a helpful and accurate response to the user's question."""
+
             result = self.raindrop.inference.query(
                 prompt=prompt,
                 system_prompt=self.SYSTEM_PROMPT,
-                max_tokens=300,
+                max_tokens=400,
                 temperature=0.7,
             )
             
-            # 7. Store query in memory for context
-            self._store_query_context(user_id, question, city)
-            
             latency_ms = int((time.time() - start_time) * 1000)
             
+            # 5. Build response
             return QueryResult(
                 answer=result["response"],
-                confidence=0.9 if readings else 0.7,
+                confidence=0.95,  # High confidence with real data
                 latency_ms=latency_ms,
-                sources=[{"type": "openaq", "readings": len(readings)}],
+                sources=[{
+                    "type": "openaq",
+                    "city": city,
+                    "readings": len(readings),
+                    "stations": [r.location_name for r in readings]
+                }],
                 readings=readings,
                 metadata={
                     "city": city,
-                    "model": result.get("model"),
+                    "data_points": len(readings),
                     "inference_latency_ms": result.get("latency_ms"),
                 },
             )
@@ -143,7 +176,7 @@ Always respond in a helpful, informative tone. Keep responses under 150 words un
     
     def compare(self, city1: str, city2: str, user_id: str = "default") -> QueryResult:
         """
-        Compare air quality between two cities.
+        Compare air quality between two cities using real data.
         
         Args:
             city1: First city
@@ -156,100 +189,66 @@ Always respond in a helpful, informative tone. Keep responses under 150 words un
         start_time = time.time()
         
         try:
-            # Get comparison data
-            comparison = self.data_service.compare_cities(city1, city2)
+            # Normalize city names
+            city1 = normalize_city_name(city1)
+            city2 = normalize_city_name(city2)
             
-            # Build prompt for comparison
-            prompt = f"""Compare the air quality between {city1} and {city2}.
+            # Get readings for both cities
+            readings1 = self.city_index.get_readings_for_city(city1, limit=3)
+            readings2 = self.city_index.get_readings_for_city(city2, limit=3)
+            
+            # Build comparison context
+            context1 = self._build_data_context(city1, readings1) if readings1 else f"No data available for {city1}"
+            context2 = self._build_data_context(city2, readings2) if readings2 else f"No data available for {city2}"
+            
+            prompt = f"""Compare the air quality between {city1.title()} and {city2.title()}.
 
-Data for {city1}:
-- Average AQI: {comparison['city1'].get('avg_aqi', 'N/A')}
-- Average PM2.5: {comparison['city1'].get('avg_pm25', 'N/A')} μg/m³
-- Worst Category: {comparison['city1'].get('worst_category', 'N/A')}
-- Number of readings: {comparison['city1'].get('num_readings', 0)}
+{city1.upper()} DATA:
+{context1}
 
-Data for {city2}:
-- Average AQI: {comparison['city2'].get('avg_aqi', 'N/A')}
-- Average PM2.5: {comparison['city2'].get('avg_pm25', 'N/A')} μg/m³
-- Worst Category: {comparison['city2'].get('worst_category', 'N/A')}
-- Number of readings: {comparison['city2'].get('num_readings', 0)}
+{city2.upper()} DATA:
+{context2}
 
-Provide a clear comparison highlighting which city has better air quality and any health recommendations."""
+Provide a clear comparison:
+1. Which city has better air quality right now?
+2. What are the specific differences in PM2.5/AQI?
+3. Health recommendations for each city"""
 
             result = self.raindrop.inference.query(
                 prompt=prompt,
                 system_prompt=self.SYSTEM_PROMPT,
-                max_tokens=400,
+                max_tokens=500,
             )
             
             latency_ms = int((time.time() - start_time) * 1000)
             
-            # Collect readings from both cities
-            all_readings = []
-            readings1 = self.data_service.get_air_quality(city1, limit=3)
-            readings2 = self.data_service.get_air_quality(city2, limit=3)
-            all_readings.extend(readings1)
-            all_readings.extend(readings2)
+            all_readings = readings1 + readings2
             
             return QueryResult(
                 answer=result["response"],
-                confidence=0.9,
+                confidence=0.9 if readings1 and readings2 else 0.7,
                 latency_ms=latency_ms,
-                sources=[{"cities": [city1, city2], "comparison": comparison}],
+                sources=[{
+                    "type": "comparison",
+                    "cities": [city1, city2],
+                    "data_available": [bool(readings1), bool(readings2)]
+                }],
                 readings=all_readings,
-                metadata={"comparison": comparison},
+                metadata={
+                    "city1": city1,
+                    "city2": city2,
+                    "city1_readings": len(readings1),
+                    "city2_readings": len(readings2),
+                },
             )
             
         except Exception as e:
             latency_ms = int((time.time() - start_time) * 1000)
             return QueryResult.error(str(e), latency_ms)
     
-    def explain_reading(self, reading: AirReading, user_id: str = "default") -> QueryResult:
-        """
-        Explain an air quality reading in detail.
-        
-        Args:
-            reading: Air quality reading to explain
-            user_id: User identifier
-            
-        Returns:
-            QueryResult with explanation
-        """
-        start_time = time.time()
-        
-        prompt = f"""Explain this air quality reading and provide health recommendations:
-
-Location: {reading.location_name}, {reading.city}, {reading.country}
-PM2.5: {reading.pm25} μg/m³
-AQI: {reading.aqi or reading.calculate_aqi()}
-Health Category: {reading.get_health_category()}
-Time: {reading.timestamp}
-
-Explain:
-1. What these numbers mean
-2. Health implications
-3. Recommendations for outdoor activities
-4. Who should be most careful"""
-
-        result = self.raindrop.inference.query(
-            prompt=prompt,
-            system_prompt=self.SYSTEM_PROMPT,
-            max_tokens=350,
-        )
-        
-        latency_ms = int((time.time() - start_time) * 1000)
-        
-        return QueryResult(
-            answer=result["response"],
-            confidence=0.95,
-            latency_ms=latency_ms,
-            sources=[{"type": "explanation"}],
-            readings=[reading],
-        )
-    
     def get_health_advice(self, city: str, user_id: str = "default") -> QueryResult:
         """
-        Get health advice for current air quality in a city.
+        Get detailed health advice based on current air quality.
         
         Args:
             city: City name
@@ -260,43 +259,44 @@ Explain:
         """
         start_time = time.time()
         
-        readings = self.data_service.get_air_quality(city, limit=5)
+        city = normalize_city_name(city)
+        readings = self.city_index.get_readings_for_city(city, limit=3)
         
         if not readings:
             latency_ms = int((time.time() - start_time) * 1000)
             return QueryResult.no_data(city, latency_ms)
         
-        # Use the worst reading for advice
-        worst_reading = max(
-            readings,
-            key=lambda r: r.aqi or r.calculate_aqi() or 0
-        )
+        # Get worst reading for conservative advice
+        worst_reading = max(readings, key=lambda r: r.aqi or r.calculate_aqi() or 0)
         
-        prompt = f"""Based on the current air quality in {city}, provide detailed health advice.
+        context = self._build_data_context(city, readings)
+        
+        prompt = f"""Provide detailed health advice for {city.title()} based on current air quality.
 
-Current conditions:
-- PM2.5: {worst_reading.pm25} μg/m³
-- AQI: {worst_reading.aqi or worst_reading.calculate_aqi()}
-- Category: {worst_reading.get_health_category()}
+CURRENT CONDITIONS:
+{context}
 
 Provide specific advice for:
-1. General population
-2. Children and elderly
-3. People with respiratory conditions
-4. Athletes and outdoor workers
-5. Recommended activities and precautions"""
+1. 👶 Children and elderly
+2. 🏃 Athletes and outdoor workers  
+3. 😷 People with asthma/respiratory conditions
+4. 👤 General population
+5. 🏠 Indoor vs outdoor recommendations
+6. 😷 Mask recommendations (if needed)
+
+Be specific about what activities are safe or should be avoided."""
 
         result = self.raindrop.inference.query(
             prompt=prompt,
             system_prompt=self.SYSTEM_PROMPT,
-            max_tokens=400,
+            max_tokens=600,
         )
         
         latency_ms = int((time.time() - start_time) * 1000)
         
         return QueryResult(
             answer=result["response"],
-            confidence=0.9,
+            confidence=0.95,
             latency_ms=latency_ms,
             sources=[{"type": "health_advice", "city": city}],
             readings=readings,
@@ -310,6 +310,11 @@ Provide specific advice for:
         """
         Extract city name from a question.
         
+        Uses multiple strategies:
+        1. Check for known city aliases
+        2. Pattern matching for common phrases
+        3. Check against city index
+        
         Args:
             question: User's question
             
@@ -318,91 +323,157 @@ Provide specific advice for:
         """
         question_lower = question.lower()
         
-        # Check aliases first
-        for alias, full_name in self.CITY_ALIASES.items():
-            if alias in question_lower.split():
-                return full_name
+        # 1. Check aliases
+        for alias, city in self.CITY_ALIASES.items():
+            # Use word boundary to avoid partial matches
+            if re.search(rf'\b{alias}\b', question_lower):
+                return city
         
-        # Common city names to look for
+        # 2. Common city names (expanded list)
         common_cities = [
-            "tokyo", "delhi", "new delhi", "mumbai", "beijing", "shanghai",
-            "london", "paris", "berlin", "rome", "madrid",
+            # Asia
+            "delhi", "mumbai", "bangalore", "chennai", "kolkata", "hyderabad",
+            "beijing", "shanghai", "guangzhou", "shenzhen", "hong kong",
+            "tokyo", "osaka", "seoul", "singapore", "bangkok", "jakarta",
+            "manila", "ho chi minh", "hanoi", "kuala lumpur",
+            # Europe
+            "london", "paris", "berlin", "madrid", "rome", "amsterdam",
+            "brussels", "vienna", "prague", "warsaw", "moscow", "barcelona",
+            # Americas
             "new york", "los angeles", "chicago", "houston", "phoenix",
             "san francisco", "seattle", "boston", "miami", "denver",
-            "toronto", "vancouver", "montreal",
-            "sydney", "melbourne", "auckland",
-            "singapore", "hong kong", "seoul", "osaka", "bangkok",
-            "dubai", "cairo", "lagos", "johannesburg",
-            "sao paulo", "rio de janeiro", "mexico city", "buenos aires",
+            "toronto", "vancouver", "montreal", "mexico city", "sao paulo",
+            # Middle East & Africa
+            "dubai", "cairo", "tel aviv", "johannesburg", "lagos", "nairobi",
+            # Oceania
+            "sydney", "melbourne", "auckland", "brisbane",
+            # Countries (for broad queries)
+            "india", "china", "united states", "united kingdom", "japan",
+            "germany", "france", "canada", "australia", "brazil",
         ]
         
         for city in common_cities:
             if city in question_lower:
-                return city.title()
+                return city
         
-        # Try to extract using patterns like "in <City>" or "for <City>"
+        # 3. Pattern matching: "in <City>", "for <City>"
         patterns = [
-            r"in\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
-            r"for\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
-            r"of\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
-            r"at\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
+            r"(?:in|for|at|of)\s+([A-Z][a-zA-Z\s]+?)(?:\s+(?:right now|today|currently|now))?[?\.\,]?$",
+            r"(?:in|for|at|of)\s+([A-Z][a-zA-Z\s]+?)(?:\s+air)",
+            r"^([A-Z][a-zA-Z\s]+?)\s+air\s+quality",
         ]
         
         for pattern in patterns:
             match = re.search(pattern, question)
             if match:
-                return match.group(1)
+                potential_city = match.group(1).strip().lower()
+                # Verify it's in our index
+                if self.city_index.is_city_available(potential_city):
+                    return potential_city
         
         return None
     
-    def _build_context(
-        self,
-        readings: List[AirReading],
-        docs: List[Dict],
-        user_context: Dict,
-    ) -> str:
-        """Build context string for the LLM."""
-        parts = []
+    def _build_data_context(self, city: str, readings: List[AirReading]) -> str:
+        """
+        Build a rich context string from air quality readings.
         
-        if readings:
-            parts.append("Current Air Quality Readings:")
-            for r in readings[:5]:
-                parts.append(
-                    f"- {r.location_name}, {r.city}: "
-                    f"PM2.5={r.pm25:.1f} μg/m³, "
-                    f"AQI={r.aqi or r.calculate_aqi()}, "
-                    f"Category={r.get_health_category()}"
-                )
+        Args:
+            city: City name
+            readings: List of readings
+            
+        Returns:
+            Formatted context string
+        """
+        if not readings:
+            return f"No data available for {city}"
         
-        if docs:
-            parts.append("\nRelated Historical Data:")
-            for doc in docs[:3]:
-                data = doc.get("data", {})
-                parts.append(f"- {data.get('city', 'Unknown')}: PM2.5={data.get('pm25', 'N/A')}")
+        lines = [f"City: {city.title()}"]
+        lines.append(f"Data Points: {len(readings)} monitoring station(s)")
+        lines.append("")
         
-        if user_context:
-            if "last_city" in user_context:
-                parts.append(f"\nUser previously asked about: {user_context['last_city']}")
+        for i, reading in enumerate(readings, 1):
+            aqi = reading.aqi or reading.calculate_aqi()
+            category = reading.get_health_category()
+            color = reading.get_health_color()
+            
+            lines.append(f"Station {i}: {reading.location_name}")
+            lines.append(f"  - PM2.5: {reading.pm25:.1f} μg/m³")
+            lines.append(f"  - AQI: {aqi}")
+            lines.append(f"  - Category: {color} {category}")
+            lines.append(f"  - Country: {reading.country}")
+            lines.append("")
         
-        return "\n".join(parts) if parts else "No specific data available."
+        # Add summary
+        pm25_values = [r.pm25 for r in readings if r.pm25]
+        aqi_values = [r.aqi or r.calculate_aqi() for r in readings]
+        
+        if pm25_values:
+            avg_pm25 = sum(pm25_values) / len(pm25_values)
+            max_pm25 = max(pm25_values)
+            lines.append(f"Summary:")
+            lines.append(f"  - Average PM2.5: {avg_pm25:.1f} μg/m³")
+            lines.append(f"  - Highest PM2.5: {max_pm25:.1f} μg/m³")
+            
+            if aqi_values:
+                avg_aqi = sum(aqi_values) / len(aqi_values)
+                max_aqi = max(aqi_values)
+                lines.append(f"  - Average AQI: {avg_aqi:.0f}")
+                lines.append(f"  - Highest AQI: {max_aqi:.0f}")
+        
+        return "\n".join(lines)
     
-    def _build_prompt(self, question: str, context: str) -> str:
-        """Build the full prompt for the LLM."""
-        return f"""User Question: {question}
+    def _handle_no_city(self, question: str, start_time: float) -> QueryResult:
+        """Handle questions where no city could be extracted."""
+        prompt = f"""The user asked: "{question}"
 
-Available Data:
-{context}
+I couldn't identify a specific city in this question. Please:
+1. If this is a general air quality question, provide helpful information
+2. If they're asking about a specific location, ask them to clarify which city
+3. Suggest some example cities they could ask about
 
-Please provide a helpful, accurate response based on the available data. If the data is limited, acknowledge this and provide general guidance."""
-    
-    def _store_query_context(self, user_id: str, question: str, city: Optional[str]):
-        """Store query context in SmartMemory for future reference."""
-        if city:
-            self.raindrop.memory.store("last_city", city, user_id=user_id)
+Keep the response helpful and friendly."""
+
+        result = self.raindrop.inference.query(
+            prompt=prompt,
+            system_prompt=self.SYSTEM_PROMPT,
+            max_tokens=300,
+        )
         
-        # Store recent queries (keep last 5)
-        recent = self.raindrop.memory.retrieve("recent_queries", user_id=user_id) or []
-        recent.insert(0, {"question": question, "city": city, "timestamp": time.time()})
-        recent = recent[:5]
-        self.raindrop.memory.store("recent_queries", recent, user_id=user_id)
+        latency_ms = int((time.time() - start_time) * 1000)
+        
+        return QueryResult(
+            answer=result["response"],
+            confidence=0.6,
+            latency_ms=latency_ms,
+            sources=[{"type": "general"}],
+            metadata={"city_extracted": False},
+        )
+    
+    def _handle_no_data(self, city: str, question: str, start_time: float) -> QueryResult:
+        """Handle cases where city is recognized but no data is available."""
+        prompt = f"""The user asked about {city}, but I don't have current monitoring data for that location.
 
+User question: "{question}"
+
+Please:
+1. Apologize for not having data for {city}
+2. Suggest nearby cities or countries that might have data
+3. Recommend checking local air quality services for {city}
+
+Available regions with good data: India (Delhi, etc.), China (Beijing, Shanghai), UK (London), USA (New York, LA), Australia (Sydney)"""
+
+        result = self.raindrop.inference.query(
+            prompt=prompt,
+            system_prompt=self.SYSTEM_PROMPT,
+            max_tokens=250,
+        )
+        
+        latency_ms = int((time.time() - start_time) * 1000)
+        
+        return QueryResult(
+            answer=result["response"],
+            confidence=0.5,
+            latency_ms=latency_ms,
+            sources=[{"type": "no_data", "city": city}],
+            metadata={"city": city, "data_available": False},
+        )

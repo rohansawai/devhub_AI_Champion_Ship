@@ -85,6 +85,7 @@ class AirSightApp:
         self.data_service: Optional[DataService] = None
         self.query_service: Optional[QueryService] = None
         self.alert_service: Optional[AlertService] = None
+        self.city_index: Optional["CityIndexService"] = None
         
         self._initialized = False
     
@@ -99,9 +100,14 @@ class AirSightApp:
             # Initialize Raindrop components
             self.raindrop.initialize_all()
             
+            # Initialize city index for fast lookups
+            from services.city_index_service import CityIndexService
+            self.city_index = CityIndexService(self.openaq)
+            self.city_index.load_index()
+            
             # Initialize services
             self.data_service = DataService(self.openaq, self.raindrop)
-            self.query_service = QueryService(self.raindrop, self.data_service)
+            self.query_service = QueryService(self.raindrop, self.openaq, self.city_index)
             self.alert_service = AlertService(self.raindrop)
             
             self._initialized = True

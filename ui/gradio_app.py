@@ -1,24 +1,63 @@
 """
-Gradio UI for AirSight.
-Provides a beautiful web interface for air quality intelligence.
+Gradio UI for AirSight with debounced city autocomplete.
 """
 
 import gradio as gr
-from typing import Tuple
+import json
+from pathlib import Path
+from typing import List
 
 from app import AirSightApp
-from models.alert import AlertType
 
 
-# =========================================
-# Global App Instance
-# =========================================
+# Load city index once at startup
+def load_city_index() -> dict:
+    try:
+        index_path = Path(__file__).parent.parent / "data" / "city_index.json"
+        with open(index_path, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
 
-app: AirSightApp = None
+CITY_INDEX = load_city_index()
+print(f"[UI] Loaded {len(CITY_INDEX)} cities for search")
 
 
-def get_app() -> AirSightApp:
-    """Get or create the app instance."""
+def search_cities(query: str) -> List[str]:
+    """Search cities - called on every keystroke (debounced by Gradio)."""
+    if not query or len(query) < 2:
+        return []
+    
+    query_lower = query.lower()
+    matches = []
+    
+    for city, sensors in CITY_INDEX.items():
+        if query_lower in city.lower():
+            matches.append((city.title(), len(sensors)))
+    
+    matches.sort(key=lambda x: x[1], reverse=True)
+    return [f"{m[0]} ({m[1]} sensors)" for m in matches[:8]]
+
+
+def update_suggestions(query: str):
+    """Update dropdown with matches."""
+    matches = search_cities(query)
+    if matches:
+        return gr.update(choices=matches, visible=True, value=None)
+    return gr.update(choices=[], visible=False)
+
+
+def select_city(selection: str, current: str) -> str:
+    """Extract city name from selection."""
+    if selection:
+        return selection.split(" (")[0]
+    return current
+
+
+# Global app
+app = None
+
+def get_app():
     global app
     if app is None:
         app = AirSightApp()
@@ -26,409 +65,119 @@ def get_app() -> AirSightApp:
     return app
 
 
-# =========================================
-# Handler Functions
-# =========================================
+def handle_ask(q):
+    if not q.strip(): return "❓ Please enter a question."
+    try: return get_app().ask(q)
+    except Exception as e: return f"❌ {e}"
 
-def handle_ask(question: str) -> str:
-    """Handle a question from the user."""
-    if not question.strip():
-        return "❓ Please enter a question about air quality."
-    
-    try:
-        return get_app().ask(question)
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
+def handle_compare(c1, c2):
+    if not c1.strip() or not c2.strip(): return "❓ Enter both cities."
+    try: return get_app().compare(c1, c2)
+    except Exception as e: return f"❌ {e}"
 
+def handle_health(c):
+    if not c.strip(): return "❓ Enter a city."
+    try: return get_app().get_health_advice(c)
+    except Exception as e: return f"❌ {e}"
 
-def handle_compare(city1: str, city2: str) -> str:
-    """Handle city comparison."""
-    if not city1.strip() or not city2.strip():
-        return "❓ Please enter both city names to compare."
-    
-    try:
-        return get_app().compare(city1, city2)
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
+def handle_data(c):
+    if not c.strip(): return "❓ Enter a city."
+    try: return get_app().get_air_quality_formatted(c, detailed=True)
+    except Exception as e: return f"❌ {e}"
 
 
-def handle_health_advice(city: str) -> str:
-    """Handle health advice request."""
-    if not city.strip():
-        return "❓ Please enter a city name."
-    
-    try:
-        return get_app().get_health_advice(city)
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
-
-
-def handle_set_alert(location: str, threshold: float, alert_type: str) -> str:
-    """Handle alert creation."""
-    if not location.strip():
-        return "❓ Please enter a location."
-    
-    try:
-        # Map display name to internal type
-        type_map = {
-            "PM2.5": "pm25",
-            "PM10": "pm10",
-            "AQI": "aqi",
-            "Ozone": "ozone",
-        }
-        internal_type = type_map.get(alert_type, "pm25")
+def create_app():
+    with gr.Blocks(title="AirSight") as demo:
         
-        return get_app().set_alert(
-            user_id="demo_user",
-            location=location,
-            threshold=threshold,
-            alert_type=internal_type,
-        )
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
-
-
-def handle_get_alerts() -> str:
-    """Handle getting alerts list."""
-    try:
-        return get_app().get_alerts_formatted("demo_user")
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
-
-
-def handle_check_alerts(city: str) -> str:
-    """Handle checking alerts for a city."""
-    if not city.strip():
-        return "❓ Please enter a city name."
-    
-    try:
-        return get_app().check_alerts("demo_user", city)
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
-
-
-def handle_get_air_quality(city: str) -> str:
-    """Handle getting air quality data."""
-    if not city.strip():
-        return "❓ Please enter a city name."
-    
-    try:
-        return get_app().get_air_quality_formatted(city, detailed=True)
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
-
-
-# =========================================
-# Gradio Interface
-# =========================================
-
-def create_app() -> gr.Blocks:
-    """Create the Gradio interface."""
-    
-    # Custom CSS for styling
-    custom_css = """
-    .gradio-container {
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
-    }
-    
-    .main-header {
-        text-align: center;
-        padding: 20px;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        border-radius: 10px;
-        margin-bottom: 20px;
-    }
-    
-    .main-header h1 {
-        color: white !important;
-        margin: 0;
-        font-size: 2.5em;
-    }
-    
-    .main-header p {
-        color: rgba(255,255,255,0.9) !important;
-        margin: 10px 0 0 0;
-    }
-    
-    .feature-card {
-        background: linear-gradient(145deg, #f0f0f0 0%, #ffffff 100%);
-        border-radius: 10px;
-        padding: 15px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-    }
-    
-    footer {
-        text-align: center;
-        padding: 20px;
-        color: #666;
-    }
-    """
-    
-    with gr.Blocks(
-        title="AirSight - Real-Time Air Quality Intelligence",
-        css=custom_css,
-        theme=gr.themes.Soft(
-            primary_hue="purple",
-            secondary_hue="blue",
-        )
-    ) as demo:
-        
-        # Header
         gr.HTML("""
-        <div class="main-header">
-            <h1>🌍 AirSight</h1>
-            <p>Real-Time Air Quality Intelligence • Powered by Cerebras</p>
+        <div style="text-align:center;padding:20px;background:linear-gradient(135deg,#667eea,#764ba2);border-radius:10px;margin-bottom:20px;">
+            <h1 style="color:white;margin:0;font-size:2.5em;">🌍 AirSight</h1>
+            <p style="color:rgba(255,255,255,0.9);margin:10px 0 0 0;">Real-Time Air Quality Intelligence • Powered by Cerebras</p>
         </div>
         """)
         
-        # Main tabs
         with gr.Tabs():
             
-            # =========================================
-            # Tab 1: Ask Questions
-            # =========================================
-            with gr.Tab("💬 Ask", id="ask"):
-                gr.Markdown("""
-                ### Ask anything about air quality
-                Get instant answers about air quality conditions anywhere in the world.
-                """)
-                
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        question_input = gr.Textbox(
-                            label="Your Question",
-                            placeholder="Is the air safe in Tokyo right now?",
-                            lines=2,
-                        )
-                    with gr.Column(scale=1):
-                        ask_btn = gr.Button("🔍 Ask", variant="primary", size="lg")
-                
-                answer_output = gr.Textbox(
-                    label="Answer",
-                    lines=10,
-                    show_copy_button=True,
-                )
+            # Ask Tab
+            with gr.Tab("💬 Ask"):
+                gr.Markdown("### Ask anything about air quality")
+                question = gr.Textbox(label="Question", placeholder="Is the air safe in Delhi?", lines=2)
+                ask_btn = gr.Button("🔍 Ask", variant="primary")
+                answer = gr.Textbox(label="Answer", lines=10)
                 
                 gr.Examples(
-                    examples=[
-                        "Is the air safe in Tokyo?",
-                        "What's the PM2.5 level in Delhi?",
-                        "Should I go jogging in Los Angeles today?",
-                        "How's the air quality in Beijing?",
-                        "Is it safe to exercise outside in Mumbai?",
-                    ],
-                    inputs=question_input,
-                    label="Example Questions",
+                    ["What is the air quality in Delhi?", 
+                     "Should I go jogging in Beijing?",
+                     "Is it safe outside in London?"],
+                    inputs=question
                 )
                 
-                ask_btn.click(
-                    fn=handle_ask,
-                    inputs=question_input,
-                    outputs=answer_output,
-                )
-                
-                question_input.submit(
-                    fn=handle_ask,
-                    inputs=question_input,
-                    outputs=answer_output,
-                )
+                ask_btn.click(handle_ask, question, answer)
+                question.submit(handle_ask, question, answer)
             
-            # =========================================
-            # Tab 2: Compare Cities
-            # =========================================
-            with gr.Tab("🔄 Compare", id="compare"):
-                gr.Markdown("""
-                ### Compare air quality between cities
-                See which city has better air quality with instant comparisons.
-                """)
-                
-                with gr.Row():
-                    city1_input = gr.Textbox(
-                        label="City 1",
-                        placeholder="Tokyo",
-                    )
-                    city2_input = gr.Textbox(
-                        label="City 2",
-                        placeholder="Beijing",
-                    )
-                
-                compare_btn = gr.Button("🔄 Compare", variant="primary")
-                
-                compare_output = gr.Textbox(
-                    label="Comparison Result",
-                    lines=12,
-                    show_copy_button=True,
-                )
-                
-                with gr.Row():
-                    gr.Examples(
-                        examples=[
-                            ["Tokyo", "Beijing"],
-                            ["London", "Paris"],
-                            ["New York", "Los Angeles"],
-                            ["Delhi", "Mumbai"],
-                            ["Sydney", "Singapore"],
-                        ],
-                        inputs=[city1_input, city2_input],
-                        label="Popular Comparisons",
-                    )
-                
-                compare_btn.click(
-                    fn=handle_compare,
-                    inputs=[city1_input, city2_input],
-                    outputs=compare_output,
-                )
-            
-            # =========================================
-            # Tab 3: Health Advice
-            # =========================================
-            with gr.Tab("💊 Health", id="health"):
-                gr.Markdown("""
-                ### Get health advice based on air quality
-                Personalized recommendations for your outdoor activities.
-                """)
-                
-                with gr.Row():
-                    health_city_input = gr.Textbox(
-                        label="City",
-                        placeholder="Enter city name",
-                        scale=3,
-                    )
-                    health_btn = gr.Button("💊 Get Advice", variant="primary", scale=1)
-                
-                health_output = gr.Textbox(
-                    label="Health Advice",
-                    lines=15,
-                    show_copy_button=True,
-                )
-                
-                health_btn.click(
-                    fn=handle_health_advice,
-                    inputs=health_city_input,
-                    outputs=health_output,
-                )
-            
-            # =========================================
-            # Tab 4: Alerts
-            # =========================================
-            with gr.Tab("🔔 Alerts", id="alerts"):
-                gr.Markdown("""
-                ### Set up air quality alerts
-                Get notified when air quality exceeds your thresholds.
-                """)
+            # Compare Tab
+            with gr.Tab("🔄 Compare"):
+                gr.Markdown("### Compare cities (type 2+ chars for suggestions)")
                 
                 with gr.Row():
                     with gr.Column():
-                        gr.Markdown("#### Create New Alert")
-                        alert_location = gr.Textbox(
-                            label="Location",
-                            placeholder="Delhi",
-                        )
-                        alert_type = gr.Dropdown(
-                            label="Alert Type",
-                            choices=["PM2.5", "PM10", "AQI", "Ozone"],
-                            value="PM2.5",
-                        )
-                        alert_threshold = gr.Slider(
-                            label="Threshold",
-                            minimum=10,
-                            maximum=500,
-                            value=100,
-                            step=5,
-                        )
-                        create_alert_btn = gr.Button("➕ Create Alert", variant="primary")
-                        alert_status = gr.Textbox(label="Status", lines=2)
-                    
+                        c1_input = gr.Textbox(label="City 1", placeholder="Type city...")
+                        c1_dropdown = gr.Dropdown(choices=[], visible=False, interactive=True)
                     with gr.Column():
-                        gr.Markdown("#### Your Alerts")
-                        refresh_alerts_btn = gr.Button("🔄 Refresh")
-                        alerts_list = gr.Textbox(
-                            label="Active Alerts",
-                            lines=8,
-                        )
-                        
-                        gr.Markdown("#### Check Alerts")
-                        check_city = gr.Textbox(
-                            label="City to Check",
-                            placeholder="Delhi",
-                        )
-                        check_btn = gr.Button("✓ Check Now")
-                        check_result = gr.Textbox(label="Result", lines=4)
+                        c2_input = gr.Textbox(label="City 2", placeholder="Type city...")
+                        c2_dropdown = gr.Dropdown(choices=[], visible=False, interactive=True)
                 
-                create_alert_btn.click(
-                    fn=handle_set_alert,
-                    inputs=[alert_location, alert_threshold, alert_type],
-                    outputs=alert_status,
-                )
+                cmp_btn = gr.Button("🔄 Compare", variant="primary")
+                cmp_result = gr.Textbox(label="Result", lines=12)
                 
-                refresh_alerts_btn.click(
-                    fn=handle_get_alerts,
-                    outputs=alerts_list,
-                )
+                # Debounced autocomplete
+                c1_input.change(update_suggestions, c1_input, c1_dropdown)
+                c1_dropdown.change(select_city, [c1_dropdown, c1_input], c1_input)
+                c2_input.change(update_suggestions, c2_input, c2_dropdown)
+                c2_dropdown.change(select_city, [c2_dropdown, c2_input], c2_input)
                 
-                check_btn.click(
-                    fn=handle_check_alerts,
-                    inputs=check_city,
-                    outputs=check_result,
-                )
+                gr.Examples([["Delhi", "London"], ["Beijing", "New York"]], inputs=[c1_input, c2_input])
+                cmp_btn.click(handle_compare, [c1_input, c2_input], cmp_result)
             
-            # =========================================
-            # Tab 5: Data
-            # =========================================
-            with gr.Tab("📊 Data", id="data"):
-                gr.Markdown("""
-                ### View raw air quality data
-                See detailed measurements from monitoring stations.
-                """)
+            # Health Tab
+            with gr.Tab("💊 Health"):
+                gr.Markdown("### Get health advice")
                 
-                with gr.Row():
-                    data_city_input = gr.Textbox(
-                        label="City",
-                        placeholder="Enter city name",
-                        scale=3,
-                    )
-                    data_btn = gr.Button("📊 Get Data", variant="primary", scale=1)
+                h_input = gr.Textbox(label="City", placeholder="Type city...")
+                h_dropdown = gr.Dropdown(choices=[], visible=False, interactive=True)
+                h_btn = gr.Button("💊 Get Advice", variant="primary")
+                h_result = gr.Textbox(label="Health Advice", lines=15)
                 
-                data_output = gr.Textbox(
-                    label="Air Quality Data",
-                    lines=20,
-                    show_copy_button=True,
-                )
+                h_input.change(update_suggestions, h_input, h_dropdown)
+                h_dropdown.change(select_city, [h_dropdown, h_input], h_input)
                 
-                data_btn.click(
-                    fn=handle_get_air_quality,
-                    inputs=data_city_input,
-                    outputs=data_output,
-                )
+                gr.Examples(["Delhi", "Beijing", "London"], inputs=h_input)
+                h_btn.click(handle_health, h_input, h_result)
+            
+            # Data Tab
+            with gr.Tab("📊 Data"):
+                gr.Markdown("### View raw air quality data")
+                
+                d_input = gr.Textbox(label="City", placeholder="Type city...")
+                d_dropdown = gr.Dropdown(choices=[], visible=False, interactive=True)
+                d_btn = gr.Button("📊 Get Data", variant="primary")
+                d_result = gr.Textbox(label="Data", lines=20)
+                
+                d_input.change(update_suggestions, d_input, d_dropdown)
+                d_dropdown.change(select_city, [d_dropdown, d_input], d_input)
+                
+                gr.Examples(["Delhi", "London", "India"], inputs=d_input)
+                d_btn.click(handle_data, d_input, d_result)
         
-        # Footer
-        gr.HTML("""
-        <footer>
-            <p>
-                <strong>AirSight</strong> • Built with 
-                <a href="https://openaq.org" target="_blank">OpenAQ</a> data • 
-                Powered by <a href="https://cerebras.ai" target="_blank">Cerebras</a> inference •
-                Deployed on <a href="https://raindrop.dev" target="_blank">Raindrop</a>
-            </p>
-            <p style="font-size: 0.8em; color: #999;">
-                Built for AI Championship Hackathon 2024
-            </p>
+        gr.HTML(f"""
+        <footer style="text-align:center;padding:20px;color:#666;">
+            <strong>AirSight</strong> • OpenAQ + Cerebras • {len(CITY_INDEX)} cities searchable
         </footer>
         """)
     
     return demo
 
 
-# =========================================
-# Entry Point
-# =========================================
-
 if __name__ == "__main__":
     demo = create_app()
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False,
-        show_error=True,
-    )
-
+    demo.launch(server_name="0.0.0.0", server_port=7860)

@@ -8,6 +8,10 @@ from typing import Optional
 import os
 from pathlib import Path
 
+# Load .env file if it exists
+from dotenv import load_dotenv
+load_dotenv()
+
 
 @dataclass
 class Settings:

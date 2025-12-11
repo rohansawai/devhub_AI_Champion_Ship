@@ -85,8 +85,13 @@ class OpenAQClient:
             OpenAQError: If the request fails
         """
         try:
+            # Log the API call
+            print(f"🌐 [OpenAQ] {method} {self.BASE_URL}{endpoint} params={params}")
+            
             response = self._client.request(method, endpoint, params=params)
             response.raise_for_status()
+            
+            print(f"✅ [OpenAQ] Response: {response.status_code}")
             return response.json()
         except httpx.HTTPStatusError as e:
             raise OpenAQError(
